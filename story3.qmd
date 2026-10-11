@@ -1,0 +1,350 @@
+---
+title: "Story 3: Why Do Road Deaths Differ So Much Between States?"
+subtitle: "DATA 608 · Fall 2026"
+author: "Tage Singh"
+date: today
+format:
+  typst:
+    papersize: us-letter
+    margin:
+      x: 0.8in
+      y: 0.7in
+    fig-width: 8
+    fig-height: 5
+    fig-dpi: 300
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(ggrepel)
+library(scales)
+library(maps)
+
+# Okabe-Ito (colorblind-safe) colors used for every categorical encoding
+oi <- c(orange = "#E69F00", sky = "#56B4E9", green = "#009E73",
+        blue = "#0072B2", vermillion = "#D55E00", purple = "#CC79A7",
+        black = "#000000")
+
+region_cols <- c("South" = oi[["vermillion"]], "West" = oi[["orange"]],
+                 "Midwest" = oi[["green"]], "Northeast" = oi[["blue"]])
+
+theme_story <- theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(color = "grey30", size = 11,
+                                     margin = margin(b = 8)),
+        plot.caption = element_text(color = "grey45", size = 8.5, hjust = 0),
+        plot.title.position = "plot",
+        plot.caption.position = "plot",
+        panel.grid.minor = element_blank(),
+        legend.position = "top",
+        legend.justification = "left")
+theme_set(theme_story)
+
+# ---- Data ----
+regions <- tibble(state  = c(state.name, "District of Columbia"),
+                  region = c(as.character(state.region), "South")) |>
+  mutate(region = recode(region, "North Central" = "Midwest"))
+
+data_url <- "https://raw.githubusercontent.com/tagensingh/Data608_FA2026_Story_3/main/data/"
+
+states <- read_csv(paste0(data_url, "state_master_2024.csv"), show_col_types = FALSE) |>
+  left_join(regions, by = "state") |>
+  mutate(region = factor(region, levels = names(region_cols)),
+         deaths_per_100k  = deaths / population * 1e5,
+         deaths_per_100m  = deaths / vmt_millions * 100,  # per 100M miles
+         miles_per_person = vmt_per_capita,
+         belt_law = recode(belt_law, "none (adults)" = "No adult law",
+                           primary = "Primary law",
+                           secondary = "Secondary law"))
+
+ems <- read_csv(paste0(data_url, "ems_response_by_state_2023_2024.csv"),
+                show_col_types = FALSE)
+
+# Lower-48 + DC polygons (Alaska and Hawaii are not in the maps package)
+us_map <- map_data("state") |>
+  mutate(state = str_to_title(region),
+         state = if_else(state == "District Of Columbia",
+                         "District of Columbia", state)) |>
+  select(-region)
+
+state_centers <- tibble(state = state.name,
+                        lon = state.center$x, lat = state.center$y)
+
+map_theme <- theme_void(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 15),
+        plot.subtitle = element_text(color = "grey30", size = 11,
+                                     margin = margin(b = 6)),
+        plot.caption = element_text(color = "grey45", size = 8.5, hjust = 0),
+        plot.title.position = "plot",
+        plot.caption.position = "plot",
+        legend.position = "top",
+        legend.justification = "left",
+        legend.key.width = unit(1.6, "cm"),
+        legend.key.height = unit(0.3, "cm"))
+```
+
+**Question:** Why is someone in Mississippi about five times more likely to die on the road than someone in Rhode Island?
+
+**Short answer:** Most of the gap tracks how much and where people drive. The South is deadlier even per mile, rural crash victims wait longer for help, and seat belt laws are the one factor a state can change directly.
+
+The starting point is where road deaths are highest.
+
+```{r}
+#| label: map-pop
+#| fig-height: 5.4
+pop_map <- us_map |> left_join(states, by = "state")
+
+callouts <- states |>
+  filter(state %in% c("Mississippi", "Massachusetts", "New York")) |>
+  left_join(state_centers, by = "state") |>
+  mutate(label = paste0(state, "\n", number(deaths_per_100k, 0.1)),
+         nudge_x = c(-1.5, 4, -3)[match(state, c("Mississippi","Massachusetts","New York"))],
+         nudge_y = c(-4, -3.5, 3.5)[match(state, c("Mississippi","Massachusetts","New York"))])
+
+ggplot(pop_map, aes(long, lat, group = group, fill = deaths_per_100k)) +
+  geom_polygon(color = "white", linewidth = 0.25) +
+  geom_label(data = callouts,
+             aes(x = lon + nudge_x, y = lat + nudge_y, label = label),
+             inherit.aes = FALSE, size = 3, lineheight = 0.9,
+             label.size = 0, fill = alpha("white", 0.85)) +
+  geom_segment(data = callouts,
+               aes(x = lon, y = lat, xend = lon + nudge_x * 0.8,
+                   yend = lat + nudge_y * 0.7),
+               inherit.aes = FALSE, linewidth = 0.3, color = "grey30") +
+  scale_fill_viridis_b(option = "rocket", direction = -1,
+                       breaks = c(6, 9, 12, 15, 18),
+                       name = "Road deaths per 100,000 residents, 2024") +
+  coord_map("albers", lat0 = 29.5, lat1 = 45.5) +
+  labs(title = "Road deaths peak in the rural South and parts of the Mountain West",
+       subtitle = "The Northeast loses the fewest residents to crashes.\nMississippi loses five times as many per resident as Massachusetts.",
+       caption = "Source: IIHS Fatality Facts 2024. Alaska (9.5) and Hawaii (7.1) not shown.") +
+  map_theme +
+  guides(fill = guide_colorsteps(title.position = "top"))
+```
+
+{{< pagebreak >}}
+
+The first explanation to test: do people in these states simply drive more?
+
+```{r}
+#| label: exposure
+#| fig-height: 5.6
+fit <- lm(deaths_per_100k ~ miles_per_person, data = states)
+r2  <- summary(fit)$r.squared
+south_above <- sum(resid(fit)[states$region == "South"] > 0)
+south_n     <- sum(states$region == "South")
+
+to_label <- c("Mississippi", "Wyoming", "Alabama", "New Mexico", "Arizona",
+              "South Carolina", "Massachusetts", "Rhode Island", "New York",
+              "District of Columbia", "Minnesota", "Utah", "Montana")
+
+ggplot(states, aes(miles_per_person, deaths_per_100k)) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey35",
+              fill = "grey85", linewidth = 0.6) +
+  geom_point(aes(color = region, shape = region), size = 3, alpha = 0.9) +
+  geom_text_repel(data = filter(states, state %in% to_label),
+                  aes(label = state, color = region), size = 3,
+                  show.legend = FALSE, seed = 1, min.segment.length = 0.2) +
+  annotate("label", x = 15200, y = 6.2, hjust = 1,
+           label = paste0("Miles driven per resident alone accounts for\n",
+                          percent(r2, 1), " of the state-to-state variation"),
+           size = 3.5, label.size = 0, fill = "grey95", fontface = "bold") +
+  annotate("text", x = 12500, y = 25.6, hjust = 1, size = 3.4,
+           color = oi[["vermillion"]], fontface = "bold",
+           label = paste0("Most Southern states (", south_above, " of ", south_n,
+                          ") sit above the line:\ndeadlier than their driving explains")) +
+  scale_color_manual(values = region_cols, name = NULL) +
+  scale_shape_manual(values = c(16, 17, 15, 18), name = NULL) +
+  scale_x_continuous(labels = comma, breaks = seq(6000, 16000, 2000)) +
+  labs(title = "States that drive more lose more people on the road",
+       subtitle = "Each dot is a state, 2024. Line is a linear fit with 95% confidence band.",
+       x = "Miles driven per resident per year",
+       y = "Road deaths per 100,000 residents",
+       caption = "Sources: IIHS Fatality Facts 2024 (deaths, miles driven); Census regions.") +
+  guides(color = guide_legend(override.aes = list(size = 3.5))) +
+  theme(panel.grid.major = element_blank(),
+        axis.line = element_line(color = "grey60"))
+```
+
+{{< pagebreak >}}
+
+Next: does the South still stand out once miles driven are accounted for?
+
+```{r}
+#| label: map-vmt
+#| fig-height: 5.4
+vmt_map <- us_map |> left_join(states, by = "state")
+
+ggplot(vmt_map, aes(long, lat, group = group, fill = deaths_per_100m)) +
+  geom_polygon(color = "white", linewidth = 0.25) +
+  scale_fill_viridis_b(option = "rocket", direction = -1,
+                       breaks = c(0.8, 1.0, 1.2, 1.4, 1.6),
+                       name = "Road deaths per 100 million miles driven, 2024") +
+  coord_map("albers", lat0 = 29.5, lat1 = 45.5) +
+  annotate("label", x = -88.5, y = 26, size = 3.3, label.size = 0,
+           fill = alpha("white", 0.85), fontface = "bold",
+           label = "South: 1.32 deaths per\n100M miles vs. 0.92 in the Northeast") +
+  annotate("label", x = -92.5, y = 49.8, size = 3.3, label.size = 0,
+           fill = alpha("white", 0.85), fontface = "bold",
+           label = "Minnesota, Wisconsin, North Dakota:\nrural, yet among the safest per mile") +
+  labs(title = "Even per mile driven, Southern roads are the deadliest",
+       subtitle = "Adjusting for how much people drive removes the exposure effect.\nThe South still stands out, so its roads or drivers carry extra risk.",
+       caption = "Source: IIHS Fatality Facts 2024. Alaska (1.27) and Hawaii (0.96) not shown. Regional values are pooled deaths / pooled miles.") +
+  map_theme +
+  guides(fill = guide_colorsteps(title.position = "top"))
+```
+
+{{< pagebreak >}}
+
+Rural roads may also matter after a crash, through how long it takes an ambulance to arrive.
+
+```{r}
+#| label: ems
+#| fig-height: 7.2
+ems_good <- ems |>
+  filter(pct_with_ems_times >= 60,
+         !is.na(mean_response_rural_min), !is.na(mean_response_urban_min)) |>
+  mutate(state = fct_reorder(state, mean_response_rural_min))
+
+gap <- median(ems_good$mean_response_rural_min - ems_good$mean_response_urban_min)
+top <- ems_good |> slice_max(mean_response_rural_min, n = 1)
+
+ggplot(ems_good, aes(y = state)) +
+  geom_segment(aes(x = mean_response_urban_min, xend = mean_response_rural_min,
+                   yend = state), color = "grey75", linewidth = 1) +
+  geom_point(aes(x = mean_response_urban_min), color = oi[["blue"]], size = 2.6) +
+  geom_point(aes(x = mean_response_rural_min), color = oi[["vermillion"]], size = 2.6) +
+  annotate("text", x = top$mean_response_urban_min, y = nrow(ems_good) + 1,
+           label = "Urban", color = oi[["blue"]], fontface = "bold", size = 3.4) +
+  annotate("text", x = top$mean_response_rural_min, y = nrow(ems_good) + 1,
+           label = "Rural", color = oi[["vermillion"]], fontface = "bold", size = 3.4) +
+  annotate("label", x = 15.5, y = 6, hjust = 0, size = 3.3, label.size = 0,
+           fill = "grey95", fontface = "bold",
+           label = paste0("Median gap: ", number(gap, 0.1),
+                          " extra minutes\nbefore an ambulance reaches\na rural fatal crash")) +
+  scale_x_continuous(limits = c(4, 23), breaks = seq(5, 20, 5),
+                     labels = \(x) paste(x, "min")) +
+  coord_cartesian(clip = "off") +
+  labs(title = "Rural crash victims wait about five minutes longer for help",
+       subtitle = "Mean EMS response time to fatal crashes, 2023-24, states sorted by rural response time",
+       x = "Mean time from notification to EMS arrival", y = NULL,
+       caption = paste0("Source: FARS 2023-24 via course EMS summary. Only the ", nrow(ems_good),
+                        " states reporting EMS times for at least 60% of fatal crashes are shown.\n",
+                        "CA, FL, TX, VA, NM, SC and others report too few to compare.\n",
+                        "Times cover fatal crashes only, not the average crash response.")) +
+  theme(panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 9))
+```
+
+{{< pagebreak >}}
+
+Driving habits, geography and ambulance distances are hard for a state to change. Seat belt laws are a direct policy lever, so the story ends there.
+
+```{r}
+#| label: belts
+#| fig-height: 5.6
+law_cols <- c("Primary law" = oi[["blue"]],
+              "Secondary law" = oi[["vermillion"]],
+              "No adult law" = oi[["black"]])
+
+law_avg <- states |>
+  filter(belt_law != "No adult law") |>
+  group_by(belt_law) |>
+  summarise(unbelted = sum(unrestrained_pct_of_occ_deaths * occupant_n) /
+                       sum(occupant_n))
+
+belt_label <- c("Wyoming", "Montana", "Massachusetts", "California",
+                "Nebraska", "New Hampshire", "Missouri", "Nevada", "Oregon",
+                "Arkansas", "Virginia")
+
+ggplot(states, aes(observed_belt_use_pct, unrestrained_pct_of_occ_deaths,
+                   color = belt_law)) +
+  geom_hline(data = law_avg, aes(yintercept = unbelted, color = belt_law),
+             linetype = "dashed", linewidth = 0.5, show.legend = FALSE) +
+  geom_point(aes(shape = belt_law), size = 3, alpha = 0.9) +
+  geom_text_repel(data = filter(states, state %in% belt_label),
+                  aes(label = state), size = 3, show.legend = FALSE,
+                  seed = 2, min.segment.length = 0.2) +
+  annotate("text", x = 72.5, y = 34.5, hjust = 0, size = 3.4,
+           fontface = "bold", color = oi[["vermillion"]],
+           label = paste0("Secondary-law states: ",
+                          round(law_avg$unbelted[law_avg$belt_law == "Secondary law"]),
+                          "% of killed occupants unbelted")) +
+  annotate("text", x = 72.5, y = 31.8, hjust = 0, size = 3.4,
+           fontface = "bold", color = oi[["blue"]],
+           label = paste0("Primary-law states: ",
+                          round(law_avg$unbelted[law_avg$belt_law == "Primary law"]),
+                          "% (dashed lines)")) +
+  scale_color_manual(values = law_cols, name = "Adult seat belt law") +
+  scale_shape_manual(values = c("Primary law" = 16, "Secondary law" = 17,
+                                "No adult law" = 15),
+                     name = "Adult seat belt law") +
+  scale_x_continuous(labels = label_percent(scale = 1)) +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  labs(title = "Weaker seat belt laws mean more unbelted people among the dead",
+       subtitle = "Unlike miles driven or rural geography, belt laws are something a state can change directly.\nWhere police can't stop drivers for a belt violation alone, fewer people buckle up.",
+       x = "Observed front-seat belt use",
+       y = "Share of killed vehicle occupants who were unbelted",
+       caption = "Source: IIHS Fatality Facts 2024; IIHS seat belt law table. Dashed lines are death-weighted averages by law type.\nPrimary law: police may stop a driver for a belt violation alone. Secondary law: a belt ticket only during another stop.")
+```
+
+{{< pagebreak >}}
+
+**One more pattern:** pedestrian deaths follow a different geography.
+
+```{r}
+#| label: pedestrians
+#| fig-height: 5.8
+ped <- states |>
+  mutate(ped_per_100k   = ped_n / population * 1e5,
+         other_per_100k = (deaths - ped_n) / population * 1e5)
+
+med_x <- median(ped$other_per_100k)
+med_y <- median(ped$ped_per_100k)
+
+ped_label <- c("New Mexico", "Mississippi", "Louisiana", "Nevada", "Arizona",
+               "Florida", "California", "District of Columbia", "Wyoming",
+               "Montana", "North Dakota", "Idaho", "Massachusetts", "New York")
+
+ggplot(ped, aes(other_per_100k, ped_per_100k)) +
+  geom_vline(xintercept = med_x, color = "grey70", linetype = "dashed") +
+  geom_hline(yintercept = med_y, color = "grey70", linetype = "dashed") +
+  geom_point(aes(color = region, shape = region), size = 3, alpha = 0.9) +
+  geom_text_repel(data = filter(ped, state %in% ped_label),
+                  aes(label = state, color = region), size = 3,
+                  show.legend = FALSE, seed = 3, min.segment.length = 0.2) +
+  annotate("text", x = 22.3, y = 4.2, hjust = 1, size = 3.4,
+           fontface = "bold", color = "grey20",
+           label = "Sun Belt: high on both") +
+  annotate("text", x = 22.3, y = 1.4, hjust = 1, size = 3.4,
+           fontface = "bold", color = "grey20",
+           label = "Rural Mountain and Plains:\nmany vehicle deaths, few pedestrian deaths") +
+  annotate("text", x = 3.3, y = 4.2, hjust = 0, size = 3.4,
+           fontface = "bold", color = "grey20",
+           label = "Dense cities: few vehicle deaths,\nbut pedestrians still at risk") +
+  scale_color_manual(values = region_cols, name = NULL) +
+  scale_shape_manual(values = c(16, 17, 15, 18), name = NULL) +
+  scale_y_continuous(limits = c(0, 4.5)) +
+  labs(title = "Pedestrian deaths concentrate in the Sun Belt, not the rural North",
+       subtitle = "Rural states lose people inside vehicles; warm, car-oriented Southern and Southwestern\nstates also lose them on foot",
+       x = "Non-pedestrian road deaths per 100,000 residents",
+       y = "Pedestrian deaths per 100,000 residents",
+       caption = paste0("Source: IIHS Fatality Facts 2024. Dashed lines are state medians.\n",
+                        "Rates are per resident, not share of deaths: DC's 38% pedestrian share reflects few vehicle deaths, not high pedestrian risk.")) +
+  guides(color = guide_legend(override.aes = list(size = 3.5))) +
+  theme(panel.grid.major = element_blank(),
+        axis.line = element_line(color = "grey60"))
+```
+
+**Limitations**
+
+- These are state-level associations, not proven causes. Heavy driving, rural roads and slow ambulances cluster in the same states, and state averages don't describe individual drivers.
+- Causation may also run the other way: states with more deaths may face more pressure to pass primary belt laws.
+- Small states (DC, Rhode Island, Vermont, each under 60 deaths) have noisy rates. Speeding and drunk driving were also checked but showed no clear link to death rates, so they are left out.
+
+**Data:** IIHS Fatality Facts 2024 and the FARS 2023-24 EMS summary provided for the course. The CSVs are stored at <https://github.com/tagensingh/Data608_FA2026_Story_3>.
